@@ -19,6 +19,5 @@ graphify-out
 docs
 scripts
 biome.jsonc
-drizzle.config.ts
 tsconfig.tsbuildinfo
 next-env.d.ts
