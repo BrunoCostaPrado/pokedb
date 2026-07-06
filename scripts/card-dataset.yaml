@@ -1,0 +1,6 @@
+# YOLO dataset config for Pokemon card detection
+path: ../datasets/pokemon-cards  # root
+train: images/train
+val: images/val
+nc: 1
+names: ["card"]

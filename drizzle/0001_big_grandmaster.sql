@@ -1,0 +1,1 @@
+DROP TABLE `pokedb_post`;
