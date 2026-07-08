@@ -21,6 +21,40 @@ import {
 import { Input } from "@/components/ui/input"
 import { api } from "@/trpc/react"
 
+// ponytail: resize client-side before OCR upload — reduces latency
+function resizeCanvas(
+	source: CanvasImageSource,
+	srcW: number,
+	srcH: number,
+	maxPx = 1200,
+): HTMLCanvasElement {
+	let w = srcW
+	let h = srcH
+	if (w > maxPx || h > maxPx) {
+		const r = Math.min(maxPx / w, maxPx / h)
+		w = Math.round(w * r)
+		h = Math.round(h * r)
+	}
+	const c = document.createElement("canvas")
+	c.width = w
+	c.height = h
+	// biome-ignore lint/style/noNonNullAssertion: canvas 2d context always exists in browser
+	c.getContext("2d")!.drawImage(source, 0, 0, w, h)
+	return c
+}
+
+function canvasToBlob(c: HTMLCanvasElement): Promise<Blob> {
+	return new Promise((r) =>
+		c.toBlob(
+			(b) => {
+				if (b) r(b)
+			},
+			"image/jpeg",
+			0.85,
+		),
+	)
+}
+
 export function CardViewer() {
 	const [search, setSearch] = useState("")
 	const deferredSearch = useDeferredValue(search)
@@ -145,7 +179,7 @@ function CardDisplay({
 						alt={card.name}
 						className="rounded-t-lg object-contain"
 						fill
-						loading="eager"
+						priority
 						sizes="(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw"
 						src={card.imageUrl}
 					/>
@@ -338,17 +372,8 @@ function CardFormDialog({
 	async function captureFromCamera() {
 		const video = videoRef.current
 		if (!video) return
-		const c = document.createElement("canvas")
-		c.width = video.videoWidth
-		c.height = video.videoHeight
-		// biome-ignore lint: canvas in browser always has context
-		const ctx = c.getContext("2d")!
-		ctx.drawImage(video, 0, 0)
-		const blob = await new Promise<Blob>((r) =>
-			c.toBlob((b) => {
-				if (b) r(b)
-			}, "image/jpeg"),
-		)
+		const c = resizeCanvas(video, video.videoWidth, video.videoHeight)
+		const blob = await canvasToBlob(c)
 		stopCamera()
 		await ocrAndSearch(new File([blob], "card.jpg"))
 	}

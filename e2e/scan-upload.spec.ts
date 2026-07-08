@@ -12,7 +12,7 @@ test("/scan uploads image and auto-saves", async ({ page }) => {
 		.locator('input[type="file"]')
 		.setInputFiles(path.join(SAMPLE_DIR, "SSP_252_R_EN_XS.png"))
 
-	// Wait for auto-save result (OCR → PTCG → mutate)
+	// Wait for auto-save result (OCR → search → mutate)
 	// "Card saved!" = success, "Camera not available" = OCR server down
 	await expect(page.getByText("Card saved!")).toBeVisible({ timeout: 30000 })
 })

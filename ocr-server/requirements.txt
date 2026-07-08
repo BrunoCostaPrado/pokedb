@@ -1,8 +1,11 @@
+# PyTorch (CPU-only, installed from pytorch.org CPU index)
+torch>=2.0.0
+torchvision>=0.15.0
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 easyocr>=1.7.2
 # pin Pillow for Python 3.14+ wheel availability
 Pillow>=12.0.0
 python-multipart==0.0.20
-opencv-python-headless>=4.10.0
+opencv-python-headless==5.0.0.93
 numpy>=2.0.0

@@ -4,6 +4,7 @@
  * Usage: node --env-file .env scripts/import-set.mjs <SET_CODE>
  * Example: node --env-file .env scripts/import-set.mjs SSP
  */
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { createClient } from "@libsql/client"
 import { sql } from "drizzle-orm"
 import { drizzle } from "drizzle-orm/libsql"
@@ -43,16 +44,36 @@ const prices = sqliteTable(createTable("pokedex_price"), {
 		.notNull(),
 })
 
-// ── Scrape ──
-const url = `https://limitlesstcg.com/cards/en/${setCode}?display=list`
-console.log(`Fetching ${url} …`)
-
-const res = await fetch(url)
-if (!res.ok) {
-	console.error(`HTTP ${res.status} fetching ${url}`)
-	process.exit(1)
+// ponytail: file cache for HTML (1h TTL)
+const cacheFile = new URL(`.cache/${setCode}.html`, import.meta.url)
+let html
+if (!forceReimport) {
+	try {
+		const { mtimeMs } = statSync(cacheFile)
+		if (Date.now() - mtimeMs < 3_600_000) {
+			html = readFileSync(cacheFile, "utf-8")
+			console.log(
+				`Using cached HTML (${Math.round((Date.now() - mtimeMs) / 1000)}s old)`,
+			)
+		}
+	} catch {
+		/* cache miss */
+	}
 }
-const html = await res.text()
+
+// ── Scrape ──
+if (!html) {
+	const url = `https://limitlesstcg.com/cards/en/${setCode}?display=list`
+	console.log(`Fetching ${url} …`)
+	const res = await fetch(url)
+	if (!res.ok) {
+		console.error(`HTTP ${res.status} fetching ${url}`)
+		process.exit(1)
+	}
+	html = await res.text()
+	mkdirSync(new URL(".cache/", import.meta.url), { recursive: true })
+	writeFileSync(cacheFile, html)
+}
 
 // ── Extract set name (from first card row's data-tooltip) ──
 const setNameMatch = html.match(/class="card-set"[^>]*data-tooltip="([^"]+)"/)
@@ -101,6 +122,32 @@ for (const row of rows) {
 }
 
 console.log(`Parsed ${cardEntries.length} cards`)
+
+// ── Download training images (--images flag) ──
+if (process.argv.includes("--images")) {
+	const trainingDir = new URL("../ocr-server/training-data/", import.meta.url)
+	mkdirSync(trainingDir, { recursive: true })
+	let dl = 0
+	for (const entry of cardEntries) {
+		if (!entry.imageUrl) continue
+		const filename = `${setCode}-${entry.number}.jpg`
+		const dest = new URL(filename, trainingDir)
+		try {
+			if (statSync(dest)) continue
+		} catch {
+			/* new file */
+		}
+		try {
+			const res = await fetch(entry.imageUrl)
+			if (!res.ok) continue
+			writeFileSync(dest, Buffer.from(await res.arrayBuffer()))
+			dl++
+		} catch {
+			/* skip failed download */
+		}
+	}
+	console.log(`Downloaded ${dl} training images to ocr-server/training-data/`)
+}
 
 // Early exit check
 if (cardEntries.length === 0) {
@@ -161,6 +208,118 @@ for (const entry of cardEntries) {
 	}
 
 	inserted++
+}
+
+// ── JustTCG prices (auto if JUSTTCG_API_KEY set) ──
+const justtcgKey = process.env.JUSTTCG_API_KEY
+if (justtcgKey) {
+	const setRes = await fetch(
+		`https://api.justtcg.com/v1/sets?game=pokemon&q=${encodeURIComponent(setName)}`,
+		{ headers: { "x-api-key": justtcgKey } },
+	)
+	if (setRes.ok) {
+		const setJson = await setRes.json()
+		const setId = setJson.data?.[0]?.id
+		if (setId) {
+			const cardRes = await fetch(
+				`https://api.justtcg.com/v1/cards?game=pokemon&set=${setId}&limit=100`,
+				{ headers: { "x-api-key": justtcgKey } },
+			)
+			if (cardRes.ok) {
+				const cardJson = await cardRes.json()
+				const dbCards = await db
+					.select({
+						id: cards.id,
+						name: cards.name,
+						cardNumber: cards.cardNumber,
+					})
+					.from(cards)
+					.where(sql`${cards.setName} = ${setName}`)
+				let jp = 0
+				// ponytail: match by number first, then name fallback
+				const justtcgCards = cardJson.data || []
+				for (const dbc of dbCards) {
+					const jc = justtcgCards.find(
+						(c) =>
+							(c.number && c.number === dbc.cardNumber) ||
+							c.name.toLowerCase().includes(dbc.name.toLowerCase()),
+					)
+					const price = jc?.variants?.[0]?.price
+					if (price != null) {
+						await db
+							.insert(prices)
+							.values({ cardId: dbc.id, price, source: "justtcg" })
+						jp++
+					}
+				}
+				console.log(`JustTCG prices added: ${jp}`)
+
+				// ── TCGPlayer image fallback (--images flag) ──
+				if (process.argv.includes("--images")) {
+					const trainingDir = new URL(
+						"../ocr-server/training-data/",
+						import.meta.url,
+					)
+					let dl = 0
+					for (const jc of justtcgCards) {
+						const cid = jc.tcgplayerId
+						if (!cid) continue
+						const filename = `${setCode}-${jc.number || "???"}.jpg`
+						const dest = new URL(filename, trainingDir)
+						try {
+							if (statSync(dest)) continue
+						} catch {
+							/* new */
+						}
+						const sizes = ["_200w", "_400w", "_1100w"]
+						for (const sz of sizes) {
+							const url = `https://tcgplayer-cdn.tcgplayer.com/product/${cid}${sz}.jpg`
+							try {
+								const r = await fetch(url)
+								if (
+									r.ok &&
+									r.headers.get("content-type")?.startsWith("image/")
+								) {
+									writeFileSync(dest, Buffer.from(await r.arrayBuffer()))
+									dl++
+									break
+								}
+							} catch {
+								/* try next size */
+							}
+						}
+					}
+					if (dl) console.log(`TCGPlayer images added: ${dl}`)
+				}
+			}
+		}
+	}
+}
+
+// ── Build template index (--images flag) ──
+if (process.argv.includes("--images")) {
+	const trainingDir = new URL("../ocr-server/training-data/", import.meta.url)
+	const idx = {}
+	for (const entry of cardEntries) {
+		const key = `${setCode}-${entry.number}`
+		const dest = new URL(`${key}.jpg`, trainingDir)
+		try {
+			if (statSync(dest))
+				idx[key] = {
+					name: entry.name,
+					set_name: setName,
+					number: entry.number,
+					set_code: setCode,
+				}
+		} catch {
+			/* not on disk */
+		}
+	}
+	writeFileSync(
+		new URL("_templates.json", trainingDir),
+		JSON.stringify(idx, null, 2),
+	)
+	console.log(`Template index: ${Object.keys(idx).length} entries`)
 }
 
 console.log(`Done. Inserted ${inserted}, skipped ${skipped} (already in DB).`)

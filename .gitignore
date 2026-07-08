@@ -68,3 +68,6 @@ __pycache__/
 
 # ide
 .vscode/
+# training data
+ocr-server/training-data/
+scripts/.cache/

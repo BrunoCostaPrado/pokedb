@@ -5,6 +5,40 @@ import { api } from "@/trpc/react"
 
 const OCR_URL = "http://localhost:8000"
 
+// ponytail: resize client-side before upload — reduces latency
+function resizeCanvas(
+	source: CanvasImageSource,
+	srcW: number,
+	srcH: number,
+	maxPx = 1200,
+): HTMLCanvasElement {
+	let w = srcW
+	let h = srcH
+	if (w > maxPx || h > maxPx) {
+		const r = Math.min(maxPx / w, maxPx / h)
+		w = Math.round(w * r)
+		h = Math.round(h * r)
+	}
+	const c = document.createElement("canvas")
+	c.width = w
+	c.height = h
+	// biome-ignore lint/style/noNonNullAssertion: canvas 2d context always exists in browser
+	c.getContext("2d")!.drawImage(source, 0, 0, w, h)
+	return c
+}
+
+function canvasToBlob(c: HTMLCanvasElement): Promise<Blob> {
+	return new Promise((r) =>
+		c.toBlob(
+			(b) => {
+				if (b) r(b)
+			},
+			"image/jpeg",
+			0.85,
+		),
+	)
+}
+
 export default function ScanPage() {
 	const videoRef = useRef<HTMLVideoElement>(null)
 	const fileRef = useRef<HTMLInputElement>(null)
@@ -14,7 +48,6 @@ export default function ScanPage() {
 	const [camError, setCamError] = useState<string | null>(null)
 
 	const addCard = api.card.addCard.useMutation()
-	const utils = api.useUtils()
 
 	async function ocrAndSave(fd: FormData) {
 		setLoading(true)
@@ -33,29 +66,16 @@ export default function ScanPage() {
 				parsed_set_name?: string
 			} = await res.json()
 
-			// ponytail: auto-save via PTCG if found, else fall through to
-			// addCard with OCR data (no user input needed).
-			let hit: any
-			const searchName = data.parsed_name || data.text
-			if (searchName.trim()) {
-				const hits = await utils.tcg.searchCards
-					.fetch({ name: searchName, number: data.card_number })
-					.catch(() => [])
-				hit = hits[0]
-			}
+			// ponytail: use OCR data directly, no external card search
+			const imageUrl = data.image
+				? `data:image/jpeg;base64,${data.image}`
+				: undefined
 
-			let imageUrl: string | undefined = hit?.imageUrl
-			if (!imageUrl && data.image)
-				imageUrl = `data:image/jpeg;base64,${data.image}`
-
-			const cardNumber = hit?.number ?? data.card_number ?? ""
 			await addCard.mutateAsync({
-				name: hit?.name ?? (data.parsed_name || data.text || "Unknown"),
-				setName: hit?.setName ?? (data.parsed_set_name || "Unknown"),
-				cardNumber: cardNumber || "???",
-				releaseYear: hit?.releaseYear,
+				name: data.parsed_name || data.text || "Unknown",
+				setName: data.parsed_set_name || "Unknown",
+				cardNumber: data.card_number || "???",
 				imageUrl,
-				initialPrice: hit?.marketPrice,
 			})
 			setSaved(true)
 		} finally {
@@ -87,28 +107,30 @@ export default function ScanPage() {
 	async function capture() {
 		const video = videoRef.current
 		if (!video) return
-		const c = document.createElement("canvas")
-		c.width = video.videoWidth
-		c.height = video.videoHeight
-		// biome-ignore lint: canvas in browser always has context
-		const ctx = c.getContext("2d")!
-		ctx.drawImage(video, 0, 0)
-		const blob = await new Promise<Blob>((r) =>
-			c.toBlob((b) => {
-				if (b) r(b)
-			}, "image/jpeg"),
-		)
+		const c = resizeCanvas(video, video.videoWidth, video.videoHeight)
+		const blob = await canvasToBlob(c)
 		const fd = new FormData()
 		fd.append("file", blob, "card.jpg")
 		await ocrAndSave(fd)
 	}
 
 	async function uploadImage(e: ChangeEvent<HTMLInputElement>) {
-		const file = e.target.files?.[0]
-		if (!file) return
-		const fd = new FormData()
-		fd.append("file", file)
-		await ocrAndSave(fd)
+		const files = Array.from(e.target.files ?? [])
+		for (const file of files) {
+			if (!file) continue
+			const img = new Image()
+			const url = URL.createObjectURL(file)
+			await new Promise<void>((r) => {
+				img.onload = () => r()
+				img.src = url
+			})
+			URL.revokeObjectURL(url)
+			const c = resizeCanvas(img, img.naturalWidth, img.naturalHeight)
+			const blob = await canvasToBlob(c)
+			const fd = new FormData()
+			fd.append("file", blob, file.name)
+			await ocrAndSave(fd)
+		}
 	}
 
 	function reset() {
@@ -165,6 +187,7 @@ export default function ScanPage() {
 				<input
 					accept="image/*"
 					className="hidden"
+					multiple
 					onChange={uploadImage}
 					ref={fileRef}
 					type="file"

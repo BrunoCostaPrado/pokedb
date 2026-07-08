@@ -14,24 +14,26 @@ services:
         COPY --from=deps /app/node_modules ./node_modules
         COPY . .
         ENV SKIP_ENV_VALIDATION=1
-        ENV DATABASE_URL=file:./dev.db
-        RUN pnpm build
-        RUN DATABASE_URL=file:./dev.db pnpm exec drizzle-kit push --config=./drizzle.config.ts
+        ENV DATABASE_URL=file:./data/dev.db
+        RUN mkdir -p data && pnpm build
+        RUN DATABASE_URL=file:./data/dev.db pnpm exec drizzle-kit push --config=./drizzle.config.ts
         FROM base AS runner
         WORKDIR /app
         ENV NODE_ENV=production
         COPY --from=builder /app/.next/standalone ./
         COPY --from=builder /app/.next/static ./.next/static
         COPY --from=builder /app/public ./public
-        COPY --from=builder /app/dev.db ./dev.db
+        COPY --from=builder /app/data ./data
         EXPOSE 3000
         CMD ["node", "server.js"]
     ports:
       - "3000:3000"
     env_file: .env
     environment:
-      - DATABASE_URL=file:./dev.db
+      - DATABASE_URL=file:./data/dev.db
       - NEXT_PUBLIC_OCR_URL=http://ocr:8000
+    volumes:
+      - pokedb-data:/app/data
     depends_on:
       ocr:
         condition: service_started
@@ -46,8 +48,9 @@ services:
             libgl1 libglib2.0-0 \
             && rm -rf /var/lib/apt/lists/*
         COPY requirements.txt .
-        RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
-        RUN pip install --no-cache-dir -r requirements.txt
+        RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchvision \
+            && pip install --no-cache-dir -r requirements.txt \
+            && rm -rf /root/.cache/pip
         COPY main.py .
         EXPOSE 8000
         CMD ["python", "main.py"]
@@ -55,3 +58,6 @@ services:
       - "8000:8000"
     environment:
       - OCR_PORT=8000
+
+volumes:
+  pokedb-data:

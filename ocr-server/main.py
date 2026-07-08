@@ -2,20 +2,20 @@
 
 Usage: python main.py
 POST /identify  — multipart "file", returns {"text", "card_detected", "card_number"}
-POST /health    — returns {"ok": true}
+GET  /health    — returns {"ok": true}
 """
 
 import json
 import logging
 import os
-import urllib.request
-from urllib.parse import quote
+from pathlib import Path
 
 import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 import easyocr
+
 
 logging.basicConfig(level=logging.INFO)
 _log = logging.getLogger(__name__)
@@ -29,6 +29,11 @@ app.add_middleware(
 )
 
 _reader: easyocr.Reader | None = None
+
+# ponytail: restrict to chars found on Pokemon cards — eliminates noise.
+_POKEMON_CHARS = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/-.&',!?★♂♀ "
+)
 
 
 def get_reader() -> easyocr.Reader:
@@ -122,74 +127,124 @@ def _encode(img: np.ndarray, fmt: str = ".jpg") -> bytes:
     return buf.tobytes()
 
 
-# ── Template matching (Phase 3) ──
-# ponytail: in-memory cache, reset on restart. SQLite if memory grows.
+# ── Template matching ──
 
-# ponytail: PTCG API v2 blocks Python-urllib UA
-_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-_template_cache: dict[str, dict] = {}
-PTCG = "https://api.pokemontcg.io/v2"
+TRAINING_DIR = Path(__file__).resolve().parent / "training-data"
+_INDEX_PATH = TRAINING_DIR / "_templates.json"
 
-
-def _ptcg_search(name_hint: str, number_hint: str) -> list[dict]:
-    q = f"name:{quote(name_hint)}"
-    if number_hint:
-        q += f" number:{quote(number_hint)}"
-    url = f"{PTCG}/cards?q={q}&pageSize=20&select=id,name,set,number,images"
-    req = urllib.request.Request(url, headers={"User-Agent": _UA})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read())
-    except Exception:
-        return []
-    return [
-        {
-            "id": c["id"],
-            "name": c["name"],
-            "set_name": c["set"]["name"],
-            "number": c["number"],
-            "image_url": c["images"]["large"],
-        }
-        for c in data.get("data", [])
-    ]
+_template_index: dict[str, dict] = {}
+_template_cache: dict[str, np.ndarray] = {}
 
 
-def _download_img(url: str) -> np.ndarray | None:
-    req = urllib.request.Request(url, headers={"User-Agent": _UA})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            buf = r.read()
-        arr = np.frombuffer(buf, dtype=np.uint8)
-        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    except Exception:
+def _load_template_index() -> None:
+    if _INDEX_PATH.exists():
+        try:
+            with open(_INDEX_PATH) as f:
+                _template_index.update(json.load(f))
+            _log.info("loaded %d template entries", len(_template_index))
+        except Exception as e:
+            _log.warning("failed to load template index: %s", e)
+
+
+_load_template_index()
+
+
+def _match_local(crop: np.ndarray, ocr_text: str) -> dict | None:
+    """Find best matching template from training-data/ using OCR text hint."""
+    if not _template_index:
+        return None
+    crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    ocr_lower = ocr_text.lower().strip() if ocr_text else ""
+
+    # filter candidates — any OCR word must appear in name
+    candidates: list[tuple[str, dict]] = []
+    words = [w for w in ocr_lower.split() if len(w) > 1] if ocr_lower else []
+    for key, meta in _template_index.items():
+        name = meta["name"].lower()
+        if not words or any(w in name for w in words):
+            candidates.append((key, meta))
+
+    if not candidates:
         return None
 
-
-def _match_template(crop: np.ndarray, candidates: list[dict]) -> dict | None:
-    """Return the candidate card whose image best matches the crop."""
-    crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    best_score, best_card = -1.0, None
-
-    for c in candidates:
-        cid = c["id"]
-        if cid not in _template_cache:
-            img = _download_img(c["image_url"])
+    best_score, best_meta = -1.0, None
+    for key, meta in candidates:
+        if key not in _template_cache:
+            p = TRAINING_DIR / f"{key}.jpg"
+            if not p.exists():
+                continue
+            img = cv2.imread(str(p))
             if img is None:
                 continue
-            _template_cache[cid] = {**c, "img": img}
-
-        cached = _template_cache[cid]
-        template = cv2.cvtColor(cached["img"], cv2.COLOR_BGR2GRAY)
+            _template_cache[key] = img
+        template = cv2.cvtColor(_template_cache[key], cv2.COLOR_BGR2GRAY)
         h, w = crop_gray.shape
         resized = cv2.resize(template, (w, h))
         result = cv2.matchTemplate(crop_gray, resized, cv2.TM_CCOEFF_NORMED)
         score = float(result[0, 0])
-
         if score > best_score:
-            best_score, best_card = score, c
+            best_score, best_meta = score, meta
 
-    # ponytail: low threshold — crop is already aligned, any match above noise works
-    return best_card if best_score > 0.3 else None
+    if best_meta:
+        _log.info(
+            "best template match %s #%s score=%.3f",
+            best_meta["name"],
+            best_meta["number"],
+            best_score,
+        )
+    # ponytail: low threshold — crop is aligned, any match above noise works
+    return best_meta if best_score > 0.5 else None
+
+
+# ponytail: ORB feature matcher — robust to rotation/scale where template
+# matching fails. Training data in training-data/ is the gallery.
+# Upgrade path: replace _match_local entirely with _orb_match.
+_orb = cv2.ORB_create(nfeatures=1000)
+
+
+def _orb_match(crop: np.ndarray, ocr_text: str) -> dict | None:
+    """Feature-based matching over training-data/ gallery."""
+    if not _template_index:
+        return None
+    crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    ocr_lower = ocr_text.lower().strip() if ocr_text else ""
+    words = [w for w in ocr_lower.split() if len(w) > 1] if ocr_lower else ""
+
+    kp1, des1 = _orb.detectAndCompute(crop_gray, None)
+    if des1 is None or len(kp1) < 5:
+        return None
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    best_cnt, best_meta = -1, None
+
+    for key, meta in _template_index.items():
+        name = meta["name"].lower()
+        if words and not any(w in name for w in words):
+            continue
+        if key not in _template_cache:
+            p = TRAINING_DIR / f"{key}.jpg"
+            if not p.exists():
+                continue
+            img = cv2.imread(str(p))
+            if img is None:
+                continue
+            _template_cache[key] = img
+        tg = cv2.cvtColor(_template_cache[key], cv2.COLOR_BGR2GRAY)
+        _, des2 = _orb.detectAndCompute(tg, None)
+        if des2 is None:
+            continue
+        matches = bf.match(des1, des2)
+        if len(matches) > best_cnt:
+            best_cnt, best_meta = len(matches), meta
+
+    if best_meta:
+        _log.info(
+            "ORB match %s #%s matches=%d",
+            best_meta["name"],
+            best_meta["number"],
+            best_cnt,
+        )
+    return best_meta if best_cnt > 10 else None
 
 
 # ── Endpoints ──
@@ -209,7 +264,7 @@ async def identify(file: UploadFile) -> dict:
     if card_img is None:
         # Fallback: OCR full image
         processed = preprocess(img)
-        results = reader.readtext(processed)
+        results = reader.readtext(processed, allowlist=_POKEMON_CHARS)
         text = " ".join(r[1] for r in results if r[2] > 0.3)
         return {
             "text": text.strip(),
@@ -222,7 +277,7 @@ async def identify(file: UploadFile) -> dict:
 
     # OCR on card region only
     processed = preprocess(card_img)
-    results = reader.readtext(processed)
+    results = reader.readtext(processed, allowlist=_POKEMON_CHARS)
     text = " ".join(r[1] for r in results if r[2] > 0.3)
 
     # ponytail: naive card number parse, e.g. "123/162"
@@ -237,14 +292,12 @@ async def identify(file: UploadFile) -> dict:
             set_part = text[idx + len(token) :].strip()
             break
 
-    # Phase 3: template matching fallback when OCR didn't find a number
+    # Template matching fallback — fills gaps OCR leaves behind
     match = None
-    if not card_num and name_part:
-        candidates = _ptcg_search(name_part, "")
-        if candidates:
-            match = _match_template(card_img, candidates)
-            if match:
-                _log.info("template matched: %s #%s", match["name"], match["number"])
+    if not card_num or not name_part:
+        match = _orb_match(card_img, name_part)
+        if match:
+            _log.info("template matched: %s #%s", match["name"], match["number"])
 
     if match:
         name_part = match["name"]

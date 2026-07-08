@@ -2,7 +2,7 @@
 
 **Goal:** Fix wrong card data inserted by current OCR pipeline.
 
-**Root cause:** EasyOCR misreads card text on blurry/low-res captures → wrong PTCG search match → wrong card saved.
+**Root cause:** EasyOCR misreads card text on blurry/low-res captures → wrong card saved.
 
 ---
 
@@ -41,13 +41,13 @@
 **File:** `ocr-server/main.py` (new endpoint or inline in `/identify`)
 
 - When OCR confidence < threshold OR card_number empty:
-  1. Scrape PTCG API for set's card images (lazy cache, SQLite or dict)
+  1. [Removed — pokemontcg.io is now paid. No free card image API available.]
   2. `cv2.matchTemplate` + `cv2.minMaxLoc` against card crop
-  3. Return matched card's name/number/set from PTCG data
+  3. Return matched card's name/number/set from template data
 
 **Dep:** 0 new (cv2 does it)
 
-**Data:** Fetch from `https://api.pokemontcg.io/v2/cards?q=set.id:${setId}&pageSize=250` — free, no auth
+**Data:** [Removed — pokemontcg.io is now paid.]
 
 **Cache:** Dict keyed by set ID, evict on server restart. Upgrade to SQLite if memory grows.
 

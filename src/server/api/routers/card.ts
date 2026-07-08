@@ -109,10 +109,9 @@ export const cardRouter = createTRPCRouter({
 			})
 			if (!card) throw new Error("Card not found")
 
-			// ponytail: naive JustTCG lookup by set+name. If JustTCG fails or no API key,
-			// fall back to PTCG API tcgplayer price.
+			// ponytail: naive JustTCG lookup by set+name.
 			let price: number | undefined
-			let source = "justtcg"
+			const source = "justtcg"
 
 			if (env.JUSTTCG_API_KEY) {
 				try {
@@ -144,28 +143,7 @@ export const cardRouter = createTRPCRouter({
 						}
 					}
 				} catch {
-					// JustTCG failed, fall through to PTCG fallback
-				}
-			}
-
-			// ponytail: PTCG API fallback (free, no auth)
-			if (price === undefined) {
-				source = "tcgplayer"
-				const res = await fetch(
-					`https://api.pokemontcg.io/v2/cards?q=name:${encodeURIComponent(card.name)}&pageSize=1&select=tcgplayer`,
-				)
-				if (res.ok) {
-					// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-					const json: {
-						data: {
-							tcgplayer: { prices: Record<string, { market: number }> }
-						}[]
-					} = await res.json()
-					const tcgp = json.data[0]?.tcgplayer
-					price =
-						tcgp?.prices?.holofoil?.market ??
-						tcgp?.prices?.normal?.market ??
-						undefined
+					// JustTCG failed
 				}
 			}
 
