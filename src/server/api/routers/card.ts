@@ -56,6 +56,7 @@ export const cardRouter = createTRPCRouter({
 					setName: input.setName,
 					cardNumber: input.cardNumber,
 					releaseYear: input.releaseYear,
+					// ponytail: store CDN URL directly, no local file write
 					imageUrl: input.imageUrl,
 				})
 				.returning()
@@ -155,6 +156,79 @@ export const cardRouter = createTRPCRouter({
 				source,
 			})
 			return { price, source }
+		}),
+
+	searchByOcrText: publicProcedure
+		.input(z.object({ text: z.string() }))
+		.query(async ({ input }) => {
+			// ponytail: fallback when card reference fails — search JustTCG
+			if (!env.JUSTTCG_API_KEY) return null
+			const text = input.text.trim()
+			if (!text) return null
+
+			try {
+				// Try direct card search first
+				const cardRes = await fetch(
+					`https://api.justtcg.com/v1/cards?game=pokemon&q=${encodeURIComponent(text)}&limit=5`,
+					{ headers: { "x-api-key": env.JUSTTCG_API_KEY } },
+				)
+				if (cardRes.ok) {
+					const json: {
+						data: { name: string; number: string; set_id: string }[]
+					} = await cardRes.json()
+					const hit = json.data?.[0]
+					if (hit) {
+						const setId = hit.set_id
+						const imageUrl = `https://www.limitlesstcg.com/cards/en/${setId}/${hit.number}.png`
+						// Need set name — fetch set
+						const setRes = await fetch(
+							`https://api.justtcg.com/v1/sets/${setId}`,
+							{ headers: { "x-api-key": env.JUSTTCG_API_KEY } },
+						)
+						const setName = setRes.ok
+							? ((await setRes.json()) as { name: string }).name
+							: setId
+						return {
+							name: hit.name,
+							setName,
+							cardNumber: hit.number,
+							imageUrl,
+						}
+					}
+				}
+
+				// Fallback: search sets, then cards in first set
+				const setRes = await fetch(
+					`https://api.justtcg.com/v1/sets?game=pokemon&q=${encodeURIComponent(text)}`,
+					{ headers: { "x-api-key": env.JUSTTCG_API_KEY } },
+				)
+				if (!setRes.ok) return null
+				const setJson: { data: { id: string; name: string }[] } =
+					await setRes.json()
+				const setId = setJson.data[0]?.id
+				const setName = setJson.data[0]?.name
+				if (!setId) return null
+
+				const cardRes2 = await fetch(
+					`https://api.justtcg.com/v1/cards?game=pokemon&set=${setId}&limit=100`,
+					{ headers: { "x-api-key": env.JUSTTCG_API_KEY } },
+				)
+				if (!cardRes2.ok) return null
+				const cardJson: {
+					data: { name: string; number: string }[]
+				} = await cardRes2.json()
+				const hit = cardJson.data?.[0]
+				if (!hit) return null
+
+				return {
+					name: hit.name,
+					setName: setName ?? setId,
+					cardNumber: hit.number,
+					imageUrl: `https://www.limitlesstcg.com/cards/en/${setId}/${hit.number}.png`,
+				}
+			} catch {
+				return null
+			}
 		}),
 
 	deleteCard: publicProcedure

@@ -5,14 +5,15 @@ POST /identify  — multipart "file", returns {"text", "card_detected", "card_nu
 GET  /health    — returns {"ok": true}
 """
 
-import json
 import logging
+import lzma
 import os
+import pickle
 from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import easyocr
 
@@ -29,6 +30,7 @@ app.add_middleware(
 )
 
 _reader: easyocr.Reader | None = None
+_card_ref = None
 
 # ponytail: restrict to chars found on Pokemon cards — eliminates noise.
 _POKEMON_CHARS = (
@@ -42,6 +44,38 @@ def get_reader() -> easyocr.Reader:
         _log.info("Loading EasyOCR…")
         _reader = easyocr.Reader(["en"])
     return _reader
+
+
+# ── Card Reference (pre-built master set from pokemon-card-recognizer) ──
+
+
+def load_card_ref() -> None:
+    """Load master card reference pickle (lzma-compressed)."""
+    global _card_ref
+    p = (
+        Path(__file__).resolve().parent
+        / "venv"
+        / "Lib"
+        / "site-packages"
+        / "pokemon_card_recognizer"
+        / "reference"
+        / "data"
+        / "ref_build"
+        / "master.pkl"
+    )
+    try:
+        with open(p, "rb") as f:
+            _card_ref = pickle.loads(lzma.decompress(f.read()))
+        _log.info("card reference loaded: %s (%d cards)", _card_ref.name, len(_card_ref.cards))
+    except Exception as e:
+        _log.warning("failed to load card reference: %s", e)
+
+
+def _classify_shared_words(ref_mat: np.ndarray, v: np.ndarray) -> tuple[int, np.ndarray]:
+    """Best matching card by shared word count."""
+    scores = ((ref_mat > 0) & (v > 0)).sum(axis=1)
+    prob = scores / (ref_mat > 0).sum(axis=1)
+    return int(scores.argmax()), prob
 
 
 # ── Image helpers ──
@@ -60,7 +94,6 @@ def _load(buf: bytes) -> np.ndarray:
 def preprocess(img: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     denoised = cv2.fastNlMeansDenoising(gray, h=30)
-    # sharpen
     kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
     sharpened = cv2.filter2D(denoised, -1, kernel)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -68,7 +101,6 @@ def preprocess(img: np.ndarray) -> np.ndarray:
 
 
 # ponytail: simple card detection via largest quadrilateral contour.
-# Fails on cluttered backgrounds; upgrade to a CNN detector when needed.
 def detect_card(img: np.ndarray) -> np.ndarray | None:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -86,7 +118,6 @@ def detect_card(img: np.ndarray) -> np.ndarray | None:
             if len(approx) != 4:
                 continue
             warped = _four_point_transform(img, approx.reshape(4, 2).astype(np.float32))
-            # ponytail: skip tiny crops — likely a false positive contour
             if warped.shape[0] < 100 or warped.shape[1] < 100:
                 continue
             return warped
@@ -94,13 +125,11 @@ def detect_card(img: np.ndarray) -> np.ndarray | None:
 
 
 def _four_point_transform(img: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    # ponytail: sort by y→x order. More robust than sum/diff which can alias two points.
-    # order: top-left, top-right, bottom-right, bottom-left
     by_y = pts[np.argsort(pts[:, 1])]
     top = by_y[:2]
     bottom = by_y[2:]
-    top = top[np.argsort(top[:, 0])]  # left then right
-    bottom = bottom[np.argsort(bottom[:, 0])]  # left then right
+    top = top[np.argsort(top[:, 0])]
+    bottom = bottom[np.argsort(bottom[:, 0])]
     rect = np.array([top[0], top[1], bottom[1], bottom[0]], dtype=np.float32)
 
     w = int(
@@ -120,206 +149,81 @@ def _four_point_transform(img: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return cv2.warpPerspective(img, M, (w, h))
 
 
-def _encode(img: np.ndarray, fmt: str = ".jpg") -> bytes:
-    ok, buf = cv2.imencode(fmt, img)
-    if not ok:
-        raise HTTPException(500, "Image encoding failed")
-    return buf.tobytes()
-
-
-# ── Template matching ──
-
-TRAINING_DIR = Path(__file__).resolve().parent / "training-data"
-_INDEX_PATH = TRAINING_DIR / "_templates.json"
-
-_template_index: dict[str, dict] = {}
-_template_cache: dict[str, np.ndarray] = {}
-
-
-def _load_template_index() -> None:
-    if _INDEX_PATH.exists():
-        try:
-            with open(_INDEX_PATH) as f:
-                _template_index.update(json.load(f))
-            _log.info("loaded %d template entries", len(_template_index))
-        except Exception as e:
-            _log.warning("failed to load template index: %s", e)
-
-
-_load_template_index()
-
-
-def _match_local(crop: np.ndarray, ocr_text: str) -> dict | None:
-    """Find best matching template from training-data/ using OCR text hint."""
-    if not _template_index:
-        return None
-    crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    ocr_lower = ocr_text.lower().strip() if ocr_text else ""
-
-    # filter candidates — any OCR word must appear in name
-    candidates: list[tuple[str, dict]] = []
-    words = [w for w in ocr_lower.split() if len(w) > 1] if ocr_lower else []
-    for key, meta in _template_index.items():
-        name = meta["name"].lower()
-        if not words or any(w in name for w in words):
-            candidates.append((key, meta))
-
-    if not candidates:
-        return None
-
-    best_score, best_meta = -1.0, None
-    for key, meta in candidates:
-        if key not in _template_cache:
-            p = TRAINING_DIR / f"{key}.jpg"
-            if not p.exists():
-                continue
-            img = cv2.imread(str(p))
-            if img is None:
-                continue
-            _template_cache[key] = img
-        template = cv2.cvtColor(_template_cache[key], cv2.COLOR_BGR2GRAY)
-        h, w = crop_gray.shape
-        resized = cv2.resize(template, (w, h))
-        result = cv2.matchTemplate(crop_gray, resized, cv2.TM_CCOEFF_NORMED)
-        score = float(result[0, 0])
-        if score > best_score:
-            best_score, best_meta = score, meta
-
-    if best_meta:
-        _log.info(
-            "best template match %s #%s score=%.3f",
-            best_meta["name"],
-            best_meta["number"],
-            best_score,
-        )
-    # ponytail: low threshold — crop is aligned, any match above noise works
-    return best_meta if best_score > 0.5 else None
-
-
-# ponytail: ORB feature matcher — robust to rotation/scale where template
-# matching fails. Training data in training-data/ is the gallery.
-# Upgrade path: replace _match_local entirely with _orb_match.
-_orb = cv2.ORB_create(nfeatures=1000)
-
-
-def _orb_match(crop: np.ndarray, ocr_text: str) -> dict | None:
-    """Feature-based matching over training-data/ gallery."""
-    if not _template_index:
-        return None
-    crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    ocr_lower = ocr_text.lower().strip() if ocr_text else ""
-    words = [w for w in ocr_lower.split() if len(w) > 1] if ocr_lower else ""
-
-    kp1, des1 = _orb.detectAndCompute(crop_gray, None)
-    if des1 is None or len(kp1) < 5:
-        return None
-
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    best_cnt, best_meta = -1, None
-
-    for key, meta in _template_index.items():
-        name = meta["name"].lower()
-        if words and not any(w in name for w in words):
-            continue
-        if key not in _template_cache:
-            p = TRAINING_DIR / f"{key}.jpg"
-            if not p.exists():
-                continue
-            img = cv2.imread(str(p))
-            if img is None:
-                continue
-            _template_cache[key] = img
-        tg = cv2.cvtColor(_template_cache[key], cv2.COLOR_BGR2GRAY)
-        _, des2 = _orb.detectAndCompute(tg, None)
-        if des2 is None:
-            continue
-        matches = bf.match(des1, des2)
-        if len(matches) > best_cnt:
-            best_cnt, best_meta = len(matches), meta
-
-    if best_meta:
-        _log.info(
-            "ORB match %s #%s matches=%d",
-            best_meta["name"],
-            best_meta["number"],
-            best_cnt,
-        )
-    return best_meta if best_cnt > 10 else None
-
-
 # ── Endpoints ──
 
 
-@app.post("/identify")
-async def identify(file: UploadFile) -> dict:
-    """Detect card region then OCR it for better accuracy."""
-    import base64
-
-    reader = get_reader()
-    data = await file.read()
-    _log.info("identify %s (%d bytes)", file.filename, len(data))
+def _ocr_one(reader: easyocr.Reader, data: bytes, filename: str) -> dict:
+    """Run OCR on a single image, classify against card reference."""
+    _log.info("ocr %s (%d bytes)", filename, len(data))
     img = _load(data)
     card_img = detect_card(img)
 
-    if card_img is None:
-        # Fallback: OCR full image
-        processed = preprocess(img)
-        results = reader.readtext(processed, allowlist=_POKEMON_CHARS)
-        text = " ".join(r[1] for r in results if r[2] > 0.3)
-        return {
-            "text": text.strip(),
-            "card_detected": False,
-            "card_number": "",
-            "parsed_name": text.strip(),
-            "parsed_set_name": "",
-            "image": base64.b64encode(_encode(img)).decode(),
-        }
-
-    # OCR on card region only
-    processed = preprocess(card_img)
+    # OCR the relevant image region
+    source = card_img if card_img is not None else img
+    processed = preprocess(source)
     results = reader.readtext(processed, allowlist=_POKEMON_CHARS)
-    text = " ".join(r[1] for r in results if r[2] > 0.3)
+    text = " ".join(r[1] for r in results if r[2] > 0.3).strip()
 
-    # ponytail: naive card number parse, e.g. "123/162"
-    card_num = ""
-    name_part = text.strip()
-    set_part = ""
-    for token in text.split():
-        if "/" in token and token.split("/")[0].isdigit():
-            card_num = token
-            idx = text.index(token)
-            name_part = text[:idx].strip()
-            set_part = text[idx + len(token) :].strip()
-            break
+    # Classify against card reference
+    parsed_name = text
+    card_number = ""
+    parsed_set = ""
+    card_set_id = ""
+    image_url = ""
+    card_detected = False
 
-    # Template matching fallback — fills gaps OCR leaves behind
-    match = None
-    if not card_num or not name_part:
-        match = _orb_match(card_img, name_part)
-        if match:
-            _log.info("template matched: %s #%s", match["name"], match["number"])
-
-    if match:
-        name_part = match["name"]
-        card_num = match["number"]
-        set_part = match["set_name"]
+    if _card_ref is not None and text:
+        words = [w.lower() for w in text.split() if len(w) > 1]
+        v = _card_ref.vocab.vect(words, method="encapsulation_match")
+        if v.sum() > 0:
+            idx, probs = _classify_shared_words(_card_ref.ref_mat, v)
+            conf = float(probs[idx])
+            if conf > 0.05:
+                card = _card_ref.cards[idx]
+                parsed_name = card.name
+                card_number = str(card.number)
+                parsed_set = card.set.name
+                card_set_id = card.set.id
+                # ponytail: Limitless CDN URL pattern
+                image_url = f"https://www.limitlesstcg.com/cards/en/{card_set_id}/{card_number}.png"
+                card_detected = True
+                _log.info("classified %s #%s (%s) conf=%.3f", parsed_name, card_number, parsed_set, conf)
 
     return {
-        "text": text.strip(),
-        "card_detected": True,
-        "card_number": card_num,
-        "parsed_name": name_part,
-        "parsed_set_name": set_part,
-        "image": base64.b64encode(_encode(card_img)).decode(),
+        "text": text,
+        "card_detected": card_detected,
+        "card_number": card_number,
+        "parsed_name": parsed_name,
+        "parsed_set_name": parsed_set,
+        "card_set_id": card_set_id if card_detected else "",
+        "image_url": image_url if card_detected else "",
     }
+
+
+@app.post("/identify")
+async def identify(request: Request) -> list[dict]:
+    """OCR one or more images. Returns list of results."""
+    form = await request.form()
+    file_list = form.getlist("files")
+    if not file_list:
+        single = form.get("file")
+        if single:
+            file_list = [single]
+    reader = get_reader()
+    results = []
+    for f in file_list:
+        data = await f.read()
+        results.append(_ocr_one(reader, data, f.filename or ""))
+    return results
 
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True, "loaded": _reader is not None}
+    return {"ok": True, "loaded": _reader is not None, "card_ref": _card_ref is not None}
 
 
 if __name__ == "__main__":
+    load_card_ref()
     import uvicorn
 
     port = int(os.environ.get("OCR_PORT", "8000"))

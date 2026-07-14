@@ -71,3 +71,7 @@ __pycache__/
 # training data
 ocr-server/training-data/
 scripts/.cache/
+ocr-server/training-crops
+ocr-server/easyocr-training-data/
+ocr-server/EasyOCR/
+info.txt

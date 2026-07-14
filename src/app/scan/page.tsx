@@ -48,6 +48,21 @@ export default function ScanPage() {
 	const [camError, setCamError] = useState<string | null>(null)
 
 	const addCard = api.card.addCard.useMutation()
+	const utils = api.useUtils()
+
+	async function saveCard(
+		name: string,
+		setName: string,
+		cardNumber: string,
+		imageUrl?: string,
+	) {
+		await addCard.mutateAsync({
+			name: name || "Unknown",
+			setName: setName || "Unknown",
+			cardNumber: cardNumber || "???",
+			imageUrl,
+		})
+	}
 
 	async function ocrAndSave(fd: FormData) {
 		setLoading(true)
@@ -57,26 +72,51 @@ export default function ScanPage() {
 				method: "POST",
 				body: fd,
 			})
-			const data: {
+			const results = (await res.json()) as {
 				text: string
 				card_detected: boolean
-				card_number?: string
-				image?: string
-				parsed_name?: string
-				parsed_set_name?: string
-			} = await res.json()
-
-			// ponytail: use OCR data directly, no external card search
-			const imageUrl = data.image
-				? `data:image/jpeg;base64,${data.image}`
-				: undefined
-
-			await addCard.mutateAsync({
-				name: data.parsed_name || data.text || "Unknown",
-				setName: data.parsed_set_name || "Unknown",
-				cardNumber: data.card_number || "???",
-				imageUrl,
-			})
+				card_number: string
+				parsed_name: string
+				parsed_set_name: string
+				card_set_id: string
+				image_url: string
+			}[]
+			if (!Array.isArray(results)) {
+				console.error("OCR response not array", res.status, results)
+				return
+			}
+			for (const data of results) {
+				if (data.card_detected) {
+					await saveCard(
+						data.parsed_name,
+						data.parsed_set_name,
+						data.card_number,
+						data.image_url,
+					)
+				} else {
+					// ponytail: fallback to JustTCG search when card reference fails
+					const text = data.text?.trim()
+					if (!text) continue
+					try {
+						const fallback = await utils.client.card.searchByOcrText.query({
+							text,
+						})
+						if (fallback) {
+							await saveCard(
+								fallback.name,
+								fallback.setName,
+								fallback.cardNumber,
+								fallback.imageUrl,
+							)
+						} else {
+							// ponytail: store as unknown if both fail
+							await saveCard(text, "Unknown", "???")
+						}
+					} catch {
+						await saveCard(text, "Unknown", "???")
+					}
+				}
+			}
 			setSaved(true)
 		} finally {
 			setLoading(false)
@@ -110,25 +150,29 @@ export default function ScanPage() {
 		const c = resizeCanvas(video, video.videoWidth, video.videoHeight)
 		const blob = await canvasToBlob(c)
 		const fd = new FormData()
-		fd.append("file", blob, "card.jpg")
+		fd.append("files", blob, "card.jpg")
 		await ocrAndSave(fd)
 	}
 
 	async function uploadImage(e: ChangeEvent<HTMLInputElement>) {
-		const files = Array.from(e.target.files ?? [])
-		for (const file of files) {
-			if (!file) continue
-			const img = new Image()
-			const url = URL.createObjectURL(file)
-			await new Promise<void>((r) => {
-				img.onload = () => r()
-				img.src = url
-			})
-			URL.revokeObjectURL(url)
-			const c = resizeCanvas(img, img.naturalWidth, img.naturalHeight)
-			const blob = await canvasToBlob(c)
+		const fileList = Array.from(e.target.files ?? [])
+		const BATCH = 100
+		for (let i = 0; i < fileList.length; i += BATCH) {
+			const chunk = fileList.slice(i, i + BATCH)
 			const fd = new FormData()
-			fd.append("file", blob, file.name)
+			for (const f of chunk) {
+				if (!f) continue
+				const img = new Image()
+				const url = URL.createObjectURL(f)
+				await new Promise<void>((r) => {
+					img.onload = () => r()
+					img.src = url
+				})
+				URL.revokeObjectURL(url)
+				const c = resizeCanvas(img, img.naturalWidth, img.naturalHeight)
+				const blob = await canvasToBlob(c)
+				fd.append("files", blob, f.name)
+			}
 			await ocrAndSave(fd)
 		}
 	}

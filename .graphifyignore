@@ -1,0 +1,19 @@
+# exclude cloned EasyOCR repo (57k files, all noise)
+ocr-server/EasyOCR/
+# exclude extracted OCR crop regions
+training-crops/
+# exclude fine-tuning training data (thousands of crop images)
+ocr-server/easyocr-training-data/
+# exclude scripts (import, download, training — not core app code)
+scripts/
+# exclude generated assets from HTML exports
+lib/
+*.config.ts
+*.config.js
+tsconfig.json
+package.json
+model.py
+e2e/
+*.md
+docs
+a.py

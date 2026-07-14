@@ -1,7 +1,7 @@
 "use client"
 
 import Image from "next/image"
-import { useDeferredValue, useEffect, useRef, useState } from "react"
+import { useDeferredValue, useEffect, useState } from "react"
 import { PriceChart } from "@/components/price-chart"
 import { Button } from "@/components/ui/button"
 import {
@@ -20,40 +20,6 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { api } from "@/trpc/react"
-
-// ponytail: resize client-side before OCR upload — reduces latency
-function resizeCanvas(
-	source: CanvasImageSource,
-	srcW: number,
-	srcH: number,
-	maxPx = 1200,
-): HTMLCanvasElement {
-	let w = srcW
-	let h = srcH
-	if (w > maxPx || h > maxPx) {
-		const r = Math.min(maxPx / w, maxPx / h)
-		w = Math.round(w * r)
-		h = Math.round(h * r)
-	}
-	const c = document.createElement("canvas")
-	c.width = w
-	c.height = h
-	// biome-ignore lint/style/noNonNullAssertion: canvas 2d context always exists in browser
-	c.getContext("2d")!.drawImage(source, 0, 0, w, h)
-	return c
-}
-
-function canvasToBlob(c: HTMLCanvasElement): Promise<Blob> {
-	return new Promise((r) =>
-		c.toBlob(
-			(b) => {
-				if (b) r(b)
-			},
-			"image/jpeg",
-			0.85,
-		),
-	)
-}
 
 export function CardViewer() {
 	const [search, setSearch] = useState("")
@@ -76,7 +42,16 @@ export function CardViewer() {
 	useEffect(() => {
 		const data = results.data
 		if (data) {
-			setAllCards((prev) => (offset === 0 ? data : [...prev, ...data]))
+			setAllCards((prev) => {
+				const merged = offset === 0 ? data : [...prev, ...data]
+				// ponytail: deduplicate by id — pagination can overlap
+				const seen = new Set<number>()
+				return merged.filter((c) => {
+					if (seen.has(c.id)) return false
+					seen.add(c.id)
+					return true
+				})
+			})
 		}
 	}, [results.data, offset])
 
@@ -262,58 +237,6 @@ function CardFormDialog({
 	)
 	const [imageUrl, setImageUrl] = useState(card?.imageUrl ?? "")
 	const [price, setPrice] = useState("")
-	const [photoPreview, setPhotoPreview] = useState<string | null>(null)
-	const [ocrLoading, setOcrLoading] = useState(false)
-	const [tcgResults, setTcgResults] = useState<
-		{
-			id: string
-			name: string
-			setName: string
-			number: string
-			imageUrl: string | null
-			releaseYear?: number
-			marketPrice?: number
-		}[]
-	>([])
-	const utils = api.useUtils()
-	const ocrUrl = process.env.NEXT_PUBLIC_OCR_URL ?? "http://localhost:8000"
-
-	async function ocrAndSearch(file: File) {
-		setOcrLoading(true)
-		try {
-			const form = new FormData()
-			form.append("file", file)
-			const res = await fetch(`${ocrUrl}/identify`, {
-				method: "POST",
-				body: form,
-			})
-			if (!res.ok) throw new Error(`OCR server ${res.status}`)
-			const { text, card_number } = await res.json()
-			if (!text) return
-			const results = await utils.tcg.searchCards.fetch({
-				name: text,
-				number: card_number,
-			})
-			setTcgResults(results)
-			if (results.length === 1) {
-				const r = results[0]
-				if (r) {
-					setCardName(r.name)
-					setCardSet(r.setName)
-					setCardNumber(r.number)
-					setImageUrl(r.imageUrl ?? "")
-					setReleaseYear(r.releaseYear?.toString() ?? "")
-					setPrice(r.marketPrice?.toString() ?? "")
-					setTcgResults([])
-				}
-			}
-		} catch (err) {
-			console.error("OCR failed:", err)
-		} finally {
-			setOcrLoading(false)
-		}
-	}
-
 	const addCard = api.card.addCard.useMutation({
 		onSuccess: () => {
 			setOpen(false)
@@ -336,46 +259,6 @@ function CardFormDialog({
 		setReleaseYear("")
 		setImageUrl("")
 		setPrice("")
-		setPhotoPreview(null)
-		setTcgResults([])
-	}
-
-	const videoRef = useRef<HTMLVideoElement>(null)
-	const [stream, setStream] = useState<MediaStream | null>(null)
-	const [cameraError, setCameraError] = useState("")
-
-	useEffect(() => {
-		if (videoRef.current && stream) videoRef.current.srcObject = stream
-		return () =>
-			stream?.getTracks().forEach((t) => {
-				t.stop()
-			})
-	}, [stream])
-
-	async function startCamera() {
-		setCameraError("")
-		try {
-			const s = await navigator.mediaDevices.getUserMedia({ video: true })
-			setStream(s)
-		} catch (_err) {
-			setCameraError("Camera access denied or unavailable")
-		}
-	}
-
-	function stopCamera() {
-		stream?.getTracks().forEach((t) => {
-			t.stop()
-		})
-		setStream(null)
-	}
-
-	async function captureFromCamera() {
-		const video = videoRef.current
-		if (!video) return
-		const c = resizeCanvas(video, video.videoWidth, video.videoHeight)
-		const blob = await canvasToBlob(c)
-		stopCamera()
-		await ocrAndSearch(new File([blob], "card.jpg"))
 	}
 
 	return (
@@ -435,122 +318,12 @@ function CardFormDialog({
 						}
 					}}
 				>
-					{!isEdit && (
-						<>
-							<div className="flex gap-2">
-								<Input
-									onChange={(e) => setCardName(e.target.value)}
-									placeholder="Name *"
-									required
-									value={cardName}
-								/>
-								<Button
-									disabled={!cardName}
-									onClick={async () => {
-										const results = await utils.tcg.searchCards.fetch({
-											name: cardName,
-										})
-										setTcgResults(results)
-									}}
-									type="button"
-									variant="secondary"
-								>
-									Search
-								</Button>
-							</div>
-							{tcgResults.length > 0 && (
-								<div className="max-h-40 space-y-1 overflow-y-auto rounded border p-2">
-									{tcgResults.map((r) => (
-										<button
-											className="w-full rounded p-1 text-left text-sm hover:bg-accent"
-											key={r.id}
-											onClick={() => {
-												setCardName(r.name)
-												setCardSet(r.setName)
-												setCardNumber(r.number)
-												setImageUrl(r.imageUrl ?? "")
-												setReleaseYear(r.releaseYear?.toString() ?? "")
-												setPrice(r.marketPrice?.toString() ?? "")
-												setTcgResults([])
-											}}
-											type="button"
-										>
-											{r.name} — {r.setName} #{r.number}
-										</button>
-									))}
-								</div>
-							)}
-							{/* ponytail: FileReader/URL.createObjectURL for preview, zero deps */}
-							<div className="flex gap-2">
-								<input
-									accept="image/*"
-									className="block w-full text-sm file:mr-2 file:rounded file:border-0 file:bg-secondary file:px-2 file:py-1 file:font-medium file:text-sm"
-									disabled={ocrLoading}
-									onChange={async (e) => {
-										const file = e.target.files?.[0]
-										if (file) {
-											setPhotoPreview(URL.createObjectURL(file))
-											await ocrAndSearch(file)
-										}
-									}}
-									type="file"
-								/>
-								{ocrLoading && (
-									<span className="text-muted-foreground text-sm">
-										Recognizing...
-									</span>
-								)}
-							</div>
-							{photoPreview && (
-								// biome-ignore lint/performance/noImgElement: blob URL preview
-								<img
-									alt="Uploaded card"
-									className="mx-auto max-h-32 rounded object-contain"
-									src={photoPreview}
-								/>
-							)}
-							{stream ? (
-								<div className="flex flex-col gap-2">
-									{/* biome-ignore lint: camera preview */}
-									<video
-										autoPlay
-										className="w-full rounded-lg border"
-										playsInline
-										ref={videoRef}
-									/>
-									<div className="flex gap-2">
-										<Button
-											disabled={ocrLoading}
-											onClick={captureFromCamera}
-											type="button"
-										>
-											{ocrLoading ? "Scanning..." : "Capture"}
-										</Button>
-										<Button onClick={stopCamera} type="button" variant="ghost">
-											Cancel
-										</Button>
-									</div>
-								</div>
-							) : (
-								<>
-									<Button onClick={startCamera} type="button" variant="outline">
-										Scan with Camera
-									</Button>
-									{cameraError && (
-										<p className="text-destructive text-sm">{cameraError}</p>
-									)}
-								</>
-							)}
-						</>
-					)}
-					{isEdit && (
-						<Input
-							onChange={(e) => setCardName(e.target.value)}
-							placeholder="Name *"
-							required
-							value={cardName}
-						/>
-					)}
+					<Input
+						onChange={(e) => setCardName(e.target.value)}
+						placeholder="Name *"
+						required
+						value={cardName}
+					/>
 					<Input
 						onChange={(e) => setCardSet(e.target.value)}
 						placeholder="Set Name *"
