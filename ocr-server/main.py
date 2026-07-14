@@ -66,12 +66,16 @@ def load_card_ref() -> None:
     try:
         with open(p, "rb") as f:
             _card_ref = pickle.loads(lzma.decompress(f.read()))
-        _log.info("card reference loaded: %s (%d cards)", _card_ref.name, len(_card_ref.cards))
+        _log.info(
+            "card reference loaded: %s (%d cards)", _card_ref.name, len(_card_ref.cards)
+        )
     except Exception as e:
         _log.warning("failed to load card reference: %s", e)
 
 
-def _classify_shared_words(ref_mat: np.ndarray, v: np.ndarray) -> tuple[int, np.ndarray]:
+def _classify_shared_words(
+    ref_mat: np.ndarray, v: np.ndarray
+) -> tuple[int, np.ndarray]:
     """Best matching card by shared word count."""
     scores = ((ref_mat > 0) & (v > 0)).sum(axis=1)
     prob = scores / (ref_mat > 0).sum(axis=1)
@@ -187,7 +191,13 @@ def _ocr_one(reader: easyocr.Reader, data: bytes, filename: str) -> dict:
                 # ponytail: Limitless CDN URL pattern
                 image_url = f"https://www.limitlesstcg.com/cards/en/{card_set_id}/{card_number}.png"
                 card_detected = True
-                _log.info("classified %s #%s (%s) conf=%.3f", parsed_name, card_number, parsed_set, conf)
+                _log.info(
+                    "classified %s #%s (%s) conf=%.3f",
+                    parsed_name,
+                    card_number,
+                    parsed_set,
+                    conf,
+                )
 
     return {
         "text": text,
@@ -219,7 +229,11 @@ async def identify(request: Request) -> list[dict]:
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True, "loaded": _reader is not None, "card_ref": _card_ref is not None}
+    return {
+        "ok": True,
+        "loaded": _reader is not None,
+        "card_ref": _card_ref is not None,
+    }
 
 
 if __name__ == "__main__":

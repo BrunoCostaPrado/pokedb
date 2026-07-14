@@ -1,5 +1,3 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
-
 # dependencies
 /node_modules
 /.pnp
@@ -9,8 +7,6 @@
 /coverage
 
 # database
-/prisma/db.sqlite
-/prisma/db.sqlite-journal
 db.sqlite
 
 # next.js
@@ -32,7 +28,6 @@ yarn-error.log*
 .pnpm-debug.log*
 
 # local env files
-# do not commit any .env files to git, except for the .env.example file. https://create.t3.gg/en/usage/env-variables#using-environment-variables
 .env
 .env*.local
 
@@ -42,23 +37,18 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 
-# idea files
+# ide
 .idea
+.vscode/
 
-
+# agent markers
 .caveman-active
 .ponytail-active
+
+# graph / understand
 graphify-out
 .opencode
 .understand-anything
-.playwright-mcp
-
-# generated assets
-data-sample/
-yolo-training/
-datasets/
-test-results/
-playwright-report/
 
 # python
 ocr-server/venv/
@@ -66,12 +56,6 @@ ocr-server/.venv/
 __pycache__/
 *.pyc
 
-# ide
-.vscode/
-# training data
-ocr-server/training-data/
-scripts/.cache/
-ocr-server/training-crops
-ocr-server/easyocr-training-data/
-ocr-server/EasyOCR/
+
 info.txt
+*.png
